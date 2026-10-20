@@ -1,5 +1,6 @@
 import datetime as dt
 import os
+import re
 import signal
 import threading
 import uuid
@@ -12,6 +13,7 @@ from ..devices import device_profiles, ANTPLUS_NETWORK_KEY
 from ..devices.utilities import auto_create_device, read_json
 from ..devices.common import DeviceType, DeviceData, AntPlusDevice
 from ..devices.fitness_equipment import FitnessEquipment, Workout
+from ..devices.lev import TemperatureState
 
 from ha_mqtt_discoverable import Settings, DeviceInfo
 from ha_mqtt_discoverable.sensors import (
@@ -25,6 +27,14 @@ from ha_mqtt_discoverable.sensors import (
 # the last reading has to outlive both bridge and Home Assistant restarts.
 LAST_SEEN_INTERVAL = 60  # seconds between "last seen" publishes per bike
 HEARTBEAT_INTERVAL = 60  # seconds between "bridge online" re-assertions
+
+
+def _temperature_state(state: TemperatureState) -> str:
+    """TemperatureState.ColdWarm -> "cold_warm" (a Home Assistant enum option)."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", state.name).lower()
+
+
+BATTERY_TEMPERATURE_STATES = [_temperature_state(s) for s in TemperatureState]
 
 
 class RetainedSensor(Sensor):
@@ -198,12 +208,16 @@ def device_data_mqtt_importer(
         # Different pages have different data set
         # Page names
         # Data Page # (1)
-        # if page_name == 'speed_system':
-        #     #pass
+        if page_name == 'speed_system':
+            entities["battery_temperature"].set_state(
+                _temperature_state(data.battery_temperature)
+            )
 
-        # Data Page # (2/34)
+        # Data Page # (2)
+        # (page 34 arrives as 'alt_speed_distance' and has no remaining_range)
         if page_name == 'speed_distance':
             entities["odometer"].set_state(data.odometer)
+            entities["remaining_range"].set_state(data.remaining_range)
 
         # Data Page # (3)
         if page_name == 'system_speed_2':
@@ -230,10 +244,14 @@ def device_data_mqtt_importer(
         entities = {}
 
         # Battery SOC
+        # state_class makes Home Assistant keep long-term statistics (and chart
+        # them) instead of only ~10 days of raw state history.
+
         battery_soc_info = SensorInfo(
             name="Battery Capacity",
             device_class="battery",
             unit_of_measurement="%",
+            state_class="measurement",
             unique_id="{0}_battery_soc".format(device),
             device=device_info
         )
@@ -243,6 +261,7 @@ def device_data_mqtt_importer(
         # Battery Cycles
         battery_cycles_info = SensorInfo(
             name="Battery Cycles",
+            state_class="total_increasing",
             unique_id="{0}_battery_cycles".format(device),
             device=device_info
         )
@@ -254,7 +273,9 @@ def device_data_mqtt_importer(
             name="Odometer",
             unique_id="{0}_odometer".format(device),
             device=device_info,
-            device_class="distance"
+            device_class="distance",
+            unit_of_measurement="km",
+            state_class="total_increasing"
         )
         odometer_settings = Settings(mqtt=client, entity=odometer_info)
         entities["odometer"] = RetainedSensor(odometer_settings)
@@ -264,10 +285,35 @@ def device_data_mqtt_importer(
             name="Battery Voltage",
             unique_id="{0}_battery_voltage".format(device),
             device=device_info,
-            device_class="voltage"
+            device_class="voltage",
+            unit_of_measurement="V",
+            state_class="measurement"
         )
         battery_voltage_settings = Settings(mqtt=client, entity=battery_voltage_info)
         entities["battery_voltage"] = RetainedSensor(battery_voltage_settings)
+
+        # Remaining range (the bike's own estimate)
+        remaining_range_info = SensorInfo(
+            name="Remaining Range",
+            unique_id="{0}_remaining_range".format(device),
+            device=device_info,
+            device_class="distance",
+            unit_of_measurement="km",
+            state_class="measurement"
+        )
+        remaining_range_settings = Settings(mqtt=client, entity=remaining_range_info)
+        entities["remaining_range"] = RetainedSensor(remaining_range_settings)
+
+        # Battery temperature state (cold / cold_warm / warm / warm_hot / hot)
+        battery_temperature_info = SensorInfo(
+            name="Battery Temperature",
+            unique_id="{0}_battery_temperature".format(device),
+            device=device_info,
+            device_class="enum",
+            options=BATTERY_TEMPERATURE_STATES
+        )
+        battery_temperature_settings = Settings(mqtt=client, entity=battery_temperature_info)
+        entities["battery_temperature"] = RetainedSensor(battery_temperature_settings)
 
         # Last seen (timestamp of the most recent broadcast from the bike)
         last_seen_info = SensorInfo(
