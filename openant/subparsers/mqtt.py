@@ -1,4 +1,7 @@
+import datetime as dt
 import os
+import signal
+import threading
 import uuid
 from typing import List, Optional
 import time
@@ -11,7 +14,60 @@ from ..devices.common import DeviceType, DeviceData, AntPlusDevice
 from ..devices.fitness_equipment import FitnessEquipment, Workout
 
 from ha_mqtt_discoverable import Settings, DeviceInfo
-from ha_mqtt_discoverable.sensors import Sensor, SensorInfo
+from ha_mqtt_discoverable.sensors import (
+    BinarySensor,
+    BinarySensorInfo,
+    Sensor,
+    SensorInfo,
+)
+
+# The bikes only broadcast over ANT+ while they are switched on or charging, so
+# the last reading has to outlive both bridge and Home Assistant restarts.
+LAST_SEEN_INTERVAL = 60  # seconds between "last seen" publishes per bike
+HEARTBEAT_INTERVAL = 60  # seconds between "bridge online" re-assertions
+
+
+class RetainedSensor(Sensor):
+    """Sensor whose state is retained on the broker.
+
+    ha-mqtt-discoverable's Sensor.set_state() publishes with retain=False, so
+    every Home Assistant restart blanks the sensor until the next broadcast.
+    """
+
+    def set_state(self, state, last_reset=None, force_update=True):
+        self._update_state(
+            str(state),
+            last_reset=last_reset,
+            retain=True,
+            force_update=force_update,
+        )
+
+
+class BridgeStatus(BinarySensor):
+    """Retained online/offline marker for the bridge itself.
+
+    Uses manual availability, so the broker publishes "offline" via the
+    last-will message if the process dies without disconnecting cleanly.
+    """
+
+    def announce(self):
+        self._update_state(
+            self._entity.payload_on, retain=True, force_update=True
+        )
+        return self.set_online(True)
+
+    def set_online(self, online: bool):
+        return self._update_state(
+            "online" if online else "offline",
+            topic=self.availability_topic,
+            retain=True,
+            force_update=True,
+        )
+
+
+def _raise_keyboard_interrupt(signum, frame):
+    # Let systemd's SIGTERM take the same clean-shutdown path as Ctrl-C.
+    raise KeyboardInterrupt
 
 # def write_device_data_influx(
 #     data: DeviceData,
@@ -94,29 +150,70 @@ def device_data_mqtt_importer(
     print(f"Starting device data importer UUID {session_uuid} for {devices}")
 
     device_to_entity = {}
+    last_seen_published = {}
+
+    # Bridge-level online/offline entity (last-will -> "offline" if we die)
+    status = BridgeStatus(
+        Settings(
+            mqtt=client,
+            entity=BinarySensorInfo(
+                name="Status",
+                device_class="connectivity",
+                unique_id="ant_bridge_status",
+                device=DeviceInfo(name="ant_bridge", identifiers="ant_bridge"),
+            ),
+            manual_availability=True,
+        )
+    )
+    status.announce()
+    stop_heartbeat = threading.Event()
+
+    def heartbeat():
+        # Re-assert "online" so a stale last-will from a previous run (the
+        # broker only fires it after the old keepalive expires) can't leave
+        # the retained availability stuck on "offline".
+        while not stop_heartbeat.wait(HEARTBEAT_INTERVAL):
+            status.set_online(True)
+
+    threading.Thread(target=heartbeat, name="bridge-heartbeat", daemon=True).start()
 
     # method with args saved to pass to device page update callback - could pass args list with callback instead if this gets messsy...
     def write_device_data(device, page_name, data):
         print(f"Device {device} broadcast {page_name} data: {data}")
+
+        entities = device_to_entity.get(str(device))
+        if entities is None:
+            # Data arrived before on_found registered the entities
+            return
+
+        # Retained "last seen": lets Home Assistant tell a fresh reading from
+        # a remembered one. Throttled - pages arrive every few seconds.
+        now = time.monotonic()
+        if now - last_seen_published.get(str(device), -LAST_SEEN_INTERVAL) >= LAST_SEEN_INTERVAL:
+            entities["last_seen"].set_state(
+                dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+            )
+            last_seen_published[str(device)] = now
+
         # Different pages have different data set
         # Page names
         # Data Page # (1)
         # if page_name == 'speed_system':
         #     #pass
-    
+
         # Data Page # (2/34)
         if page_name == 'speed_distance':
-            device_to_entity[str(device)]["odometer"].set_state(data.odometer)
+            entities["odometer"].set_state(data.odometer)
 
         # Data Page # (3)
         if page_name == 'system_speed_2':
-            device_to_entity[str(device)]["battery_soc"].set_state(data.battery_soc)
-        
+            entities["battery_soc"].set_state(data.battery_soc)
+
         # Data Page # (4)
         if page_name == 'battery':
-            device_to_entity[str(device)]["battery_cycles"].set_state(data.battery_cycles)
-            device_to_entity[str(device)]["battery_voltage"].set_state(data.battery_voltage)
-        
+            entities["battery_cycles"].set_state(data.battery_cycles)
+            entities["battery_voltage"].set_state(data.battery_voltage)
+
         # Data Page # (5)
         # if page_name == 'capabilities':
         #     #pass
@@ -124,8 +221,13 @@ def device_data_mqtt_importer(
     def on_found(device):
         print(f"Device {device} found and receiving")
 
+        if str(device) in device_to_entity:
+            # Re-found after losing the channel: reuse the existing entities
+            # (creating them again would open four more MQTT connections).
+            return
+
         device_info = DeviceInfo(name=str(device), identifiers=str(device))
-        device_to_entity[str(device)] = {}
+        entities = {}
 
         # Battery SOC
         battery_soc_info = SensorInfo(
@@ -136,7 +238,7 @@ def device_data_mqtt_importer(
             device=device_info
         )
         battery_soc_settings = Settings(mqtt=client, entity=battery_soc_info)
-        device_to_entity[str(device)]["battery_soc"] = Sensor(battery_soc_settings)
+        entities["battery_soc"] = RetainedSensor(battery_soc_settings)
 
         # Battery Cycles
         battery_cycles_info = SensorInfo(
@@ -145,7 +247,7 @@ def device_data_mqtt_importer(
             device=device_info
         )
         battery_cycles_settings = Settings(mqtt=client, entity=battery_cycles_info)
-        device_to_entity[str(device)]["battery_cycles"] = Sensor(battery_cycles_settings)
+        entities["battery_cycles"] = RetainedSensor(battery_cycles_settings)
 
         # Odometer
         odometer_info = SensorInfo(
@@ -155,7 +257,7 @@ def device_data_mqtt_importer(
             device_class="distance"
         )
         odometer_settings = Settings(mqtt=client, entity=odometer_info)
-        device_to_entity[str(device)]["odometer"] = Sensor(odometer_settings)
+        entities["odometer"] = RetainedSensor(odometer_settings)
 
         # Battery Voltage
         battery_voltage_info = SensorInfo(
@@ -165,13 +267,28 @@ def device_data_mqtt_importer(
             device_class="voltage"
         )
         battery_voltage_settings = Settings(mqtt=client, entity=battery_voltage_info)
-        device_to_entity[str(device)]["battery_voltage"] = Sensor(battery_voltage_settings)
-    
+        entities["battery_voltage"] = RetainedSensor(battery_voltage_settings)
+
+        # Last seen (timestamp of the most recent broadcast from the bike)
+        last_seen_info = SensorInfo(
+            name="Last Seen",
+            unique_id="{0}_last_seen".format(device),
+            device=device_info,
+            device_class="timestamp"
+        )
+        last_seen_settings = Settings(mqtt=client, entity=last_seen_info)
+        entities["last_seen"] = RetainedSensor(last_seen_settings)
+
+        # Publish only once complete so write_device_data never sees a half-built set
+        device_to_entity[str(device)] = entities
+
     for dev in devices:
         dev.on_found = lambda dev=dev: on_found(dev)
         dev.on_device_data = lambda page, page_name, data, dev=dev: write_device_data(
             dev, page_name, data
         )
+
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
 
     try:
         print(f"Starting {devices}, press Ctrl-C to finish")
@@ -179,16 +296,26 @@ def device_data_mqtt_importer(
     except KeyboardInterrupt:
         print(f"Closing ANT+ devices...")
     finally:
+        stop_heartbeat.set()
         for dev in devices:
             dev.close_channel()
 
         node.stop()
-        #client.disconnect()
+
+        # Mark the bridge offline ourselves, then disconnect cleanly so the
+        # broker doesn't also fire the last-will.
+        try:
+            info = status.set_online(False)
+            if info is not None:
+                info.wait_for_publish(timeout=3)
+            status.mqtt_client.disconnect()
+        except Exception as e:
+            print(f"Could not mark bridge offline cleanly: {e}")
 
 
 def _run(args):
     # Connect to MQTT
-    mqtt_settings = Settings.MQTT(host="10.1.10.75",)
+    mqtt_settings = Settings.MQTT(host=args.host)
 
     if args.verbose:
         print(f"Connect to MQTT {mqtt_settings}")
@@ -254,7 +381,7 @@ def add_subparser(subparsers, name="mqtt"):
     )
     antmqtt.add_argument(
         "--host",
-        default="...",
+        default="10.1.10.75",
         type=str,
         help="Host for MQTT server",
     )
